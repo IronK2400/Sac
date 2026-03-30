@@ -1,0 +1,181 @@
+import cv2
+import numpy as np
+import gradio as gr
+import matplotlib.pyplot as plt
+from PIL import Image
+import urllib.request
+import os
+
+plt.switch_backend('Agg') 
+plt.rcParams['figure.facecolor'] = '#ffffff'
+
+# ==========================================
+# 1. OPENCV MODELLERİ (Ön ve Yan Yüz)
+# ==========================================
+haarcascades = {
+    "haarcascade_frontalface_default.xml": "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
+    "haarcascade_profileface.xml": "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_profileface.xml"
+}
+for dosya, url in haarcascades.items():
+    if not os.path.exists(dosya):
+        print(f"Model indiriliyor: {dosya}...")
+        urllib.request.urlretrieve(url, dosya)
+
+on_yuz_modeli = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+yan_yuz_modeli = cv2.CascadeClassifier("haarcascade_profileface.xml")
+
+# ==========================================
+# 2. ANTI-TROLL GÜVENLİK SENSÖRÜ
+# ==========================================
+def insan_derisi_mi(img_cv):
+    # Fotoğrafın renk uzayını HSV'ye çevirip "İnsan Ten Rengi" tayfını arar.
+    hsv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2HSV)
+    # Evrensel insan ten rengi aralığı (Açık ve koyu ten dahil)
+    alt_ten = np.array([0, 20, 50], dtype=np.uint8)
+    ust_ten = np.array([30, 255, 255], dtype=np.uint8)
+    
+    ten_maskesi = cv2.inRange(hsv, alt_ten, ust_ten)
+    ten_orani = cv2.countNonZero(ten_maskesi) / (img_cv.shape[0] * img_cv.shape[1])
+    
+    # Eğer fotoğraftaki piksellerin en az %5'i insan derisi renginde değilse reddet
+    return ten_orani > 0.05 
+
+# ==========================================
+# 3. OTONOM ANALİZ MOTORU
+# ==========================================
+def otonom_guvenlikli_analiz(dosya_yolu):
+    if dosya_yolu is None:
+        return "⚠️ Lütfen fotoğraf yükleyin.", None, None
+    
+    try:
+        # Görüntü Standartlaştırma
+        img_pil = Image.open(dosya_yolu).convert('RGB')
+        img_pil = img_pil.resize((512, 512))
+        img_cv = np.array(img_pil)
+        
+        # ----------------------------------------------------
+        # 🛑 GÜVENLİK DUVARI KONTROLÜ
+        # ----------------------------------------------------
+        if not insan_derisi_mi(img_cv):
+            hata_mesaji = "## 🛑 GÜVENLİK İHLALİ TESPİT EDİLDİ\n"
+            hata_mesaji += "Yüklediğiniz fotoğrafın **insan derisi veya saçı tayfına uymadığı** tespit edilmiştir. "
+            hata_mesaji += "Sistem; manzara, hayvan tüyleri, nesneler veya aşırı karanlık fotoğrafları analiz etmeyi reddeder."
+            return hata_mesaji, None, None
+
+        img_gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
+        izolasyon_maskesi = np.zeros_like(img_gray)
+        h, w = img_gray.shape
+        merkez_x, merkez_y = w // 2, h // 2
+        
+        # Otonom Açı Taraması
+        on_yuzler = on_yuz_modeli.detectMultiScale(img_gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        yan_yuzler = yan_yuz_modeli.detectMultiScale(img_gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        
+        tespit_edilen_aci = "Bilinmiyor"
+        aci_notu = ""
+        
+        # Açıya Göre İzolasyon
+        if len(on_yuzler) > 0:
+            tespit_edilen_aci = "Ön (Alın Çizgisi)"
+            aci_notu = "🤖 **Yapay Zeka Kararı:** Kamera açısı **ÖN** olarak belirlendi. Alın bölgesi izole ediliyor."
+            (x, y, fw, fh) = sorted(on_yuzler, key=lambda b: b[2]*b[3], reverse=True)[0]
+            cv2.ellipse(izolasyon_maskesi, (x + fw//2, max(0, y - int(fh*0.1))), (int(fw*0.75), int(fh*0.9)), 0, 0, 360, 255, -1)
+            cv2.rectangle(izolasyon_maskesi, (x, y + int(fh * 0.15)), (x + fw, y + int(fh * 1.5)), 0, -1)
+
+        elif len(yan_yuzler) > 0:
+            tespit_edilen_aci = "Yan (Temporal Bölge)"
+            aci_notu = "🤖 **Yapay Zeka Kararı:** Kamera açısı **YAN** olarak belirlendi. Yüzün ön kısmı siliniyor."
+            (x, y, fw, fh) = sorted(yan_yuzler, key=lambda b: b[2]*b[3], reverse=True)[0]
+            cv2.ellipse(izolasyon_maskesi, (merkez_x, merkez_y), (int(w*0.4), int(h*0.45)), 0, 0, 360, 255, -1)
+            cv2.rectangle(izolasyon_maskesi, (x, y), (x + fw, y + int(fh * 1.5)), 0, -1)
+
+        else:
+            tespit_edilen_aci = "Tepe / Arka (Vertex & Dönör)"
+            aci_notu = "🤖 **Yapay Zeka Kararı:** Fotoğrafta yüz bulunamadı. Kameranın **TEPE** veya **ENSE** bölgesinde olduğu varsayıldı. Omuzlar siliniyor."
+            cv2.circle(izolasyon_maskesi, (merkez_x, merkez_y - 20), 220, 255, -1)
+            cv2.rectangle(izolasyon_maskesi, (0, h - 80), (w, h), 0, -1)
+
+        # Analiz ve Filtreler
+        izole_gri = cv2.bitwise_and(img_gray, img_gray, mask=izolasyon_maskesi)
+        izole_renkli = cv2.bitwise_and(img_cv, img_cv, mask=izolasyon_maskesi)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        img_clahe = clahe.apply(izole_gri)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        blackhat = cv2.morphologyEx(img_clahe, cv2.MORPH_BLACKHAT, kernel)
+        _, sac_teli_haritasi = cv2.threshold(blackhat, 15, 255, cv2.THRESH_BINARY)
+        sac_teli_haritasi = cv2.bitwise_and(sac_teli_haritasi, sac_teli_haritasi, mask=izolasyon_maskesi)
+        
+        deri_acikligi = cv2.adaptiveThreshold(img_clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 5)
+        deri_acikligi = cv2.bitwise_and(deri_acikligi, deri_acikligi, mask=izolasyon_maskesi)
+        
+        analiz_alani = cv2.countNonZero(izolasyon_maskesi)
+        if analiz_alani > 0:
+            sac_yogunlugu = cv2.countNonZero(sac_teli_haritasi) / analiz_alani
+            deri_parlamasi = cv2.countNonZero(deri_acikligi) / analiz_alani
+        else:
+            sac_yogunlugu, deri_parlamasi = 0, 0
+
+        gorsel_risk = np.clip(((deri_parlamasi * 50) + ((1 - sac_yogunlugu) * 50)) * 1.8, 0, 100)
+        
+        # Grafikler
+        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+        axs[0].imshow(sac_teli_haritasi, cmap='inferno')
+        axs[0].set_title(f"1. Saf Kök (Açı: {tespit_edilen_aci})", fontweight='bold')
+        axs[0].axis('off')
+        
+        axs[1].imshow(deri_acikligi, cmap='bone')
+        axs[1].set_title("2. İzole Deri Seyreklik Haritası", fontweight='bold')
+        axs[1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig('otonom_purevision_troll.png', dpi=120)
+        plt.close()
+        
+        seviye = "🔴 İLERİ SEYRELME" if gorsel_risk > 65 else "🟠 ORTA SEYRELME" if gorsel_risk > 35 else "🟢 SAĞLIKLI"
+        
+        rapor = f"## 🤖 Zırhlı Otonom Vizyon Raporu\n"
+        rapor += f"✅ *Anti-Troll Sensörü: İnsan dokusu doğrulandı.*\n"
+        rapor += f"**Görsel Seyrelme Oranı:** %{gorsel_risk:.1f} ({seviye})\n---\n"
+        rapor += f"{aci_notu}\n"
+        rapor += "### 🧬 Piksel Yoğunluk Analizi:\n"
+        rapor += f"- **Kök/Folikül Skoru:** %{(sac_yogunlugu * 100 * 3):.1f}\n"
+        rapor += f"- **Deri Parlama (Açıklık):** %{(deri_parlamasi * 100):.1f}\n"
+        
+        kokpit_renkli = cv2.cvtColor(izole_renkli, cv2.COLOR_BGR2RGB)
+        cv2.putText(kokpit_renkli, f"ACI: {tespit_edilen_aci}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        return rapor, 'otonom_purevision_troll.png', kokpit_renkli
+        
+    except Exception as e:
+        import traceback
+        return f"⚠️ Beklenmeyen Hata:\n{traceback.format_exc()}", None, None
+
+# ==========================================
+# 4. TEK SAYFA ZIRHLI ARAYÜZ
+# ==========================================
+with gr.Blocks(theme=gr.themes.Base()) as arayuz:
+    gr.Markdown("# 🛸 V29.0 Anti-Troll Korumalı Tam Otonom Yapay Zeka")
+    gr.Markdown("Bu sistem kameranın açısını kendisi bulur ve yüzü otomatik izole eder. **Ayrıca, kafa derisi yerine kedi, halı, araba veya manzara gibi alakasız fotoğraflar yüklendiğinde sistemi kilitleyerek hatalı teşhisleri önler.**")
+    
+    with gr.Row():
+        with gr.Column(scale=1, variant="panel"):
+            gr.Markdown("### 1. Fotoğraf Yükle")
+            foto_in = gr.Image(type="filepath", label="Analiz Edilecek Fotoğraf")
+            analiz_btn = gr.Button("🧠 Zırhlı Otonom Teşhisi Başlat", variant="primary", size="lg")
+            
+        with gr.Column(scale=2):
+            gr.Markdown("### 2. Teşhis Monitörleri")
+            rapor_out = gr.Markdown()
+            with gr.Row():
+                xray_out = gr.Image(label="Medikal Filtreler")
+                kokpit_out = gr.Image(label="YZ Görüşü (Otomatik İzolasyon)")
+
+    analiz_btn.click(
+        fn=otonom_guvenlikli_analiz, 
+        inputs=[foto_in], 
+        outputs=[rapor_out, xray_out, kokpit_out]
+    )
+
+arayuz.launch(theme=gr.themes.Monochrome())
